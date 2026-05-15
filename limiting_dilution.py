@@ -1,237 +1,177 @@
 """
 limiting_dilution.py
 ====================
-Limiting Dilution (限界希釈) Protocol Calculator
-for single-cell cloning experiments.
+Limiting Dilution — Cell Preparation Calculator
+
+「何プレートをλいくつで播くのに、何細胞・何mL用意するか」を計算するツール。
 
 Usage (Google Colab / Jupyter):
-    from limiting_dilution import launch_ui
-    launch_ui()
+    %run limiting_dilution.py   # または
+    from limiting_dilution import launch_ui; launch_ui()
 
 Usage (standalone):
     python limiting_dilution.py
 
-References:
-    Lefkovits & Waldmann (1984) Limiting Dilution Analysis of Cells of
-    the Immune System. Cambridge University Press.
+Reference:
+    Lefkovits & Waldmann (1984) Limiting Dilution Analysis of Cells
+    of the Immune System. Cambridge University Press.
 """
 
 import math
 import warnings
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch
+import matplotlib.gridspec as gridspec
 from scipy.stats import poisson
 
 warnings.filterwarnings("ignore")
 
-# Try to import Colab-specific modules
 try:
     from IPython.display import display, HTML, clear_output
     import ipywidgets as widgets
-    _COLAB_AVAILABLE = True
+    _COLAB = True
 except ImportError:
-    _COLAB_AVAILABLE = False
+    _COLAB = False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 1. Core calculation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def calculate_protocol(
-    input_conc: float,
-    input_vol_mL: float,
+def calculate(
     lambda_val: float = 0.6,
     well_vol_uL: float = 100.0,
     n_wells: int = 96,
-    max_step_df: int = 10,
-    min_transfer_uL: float = 20.0,
-    safety_factor: float = 1.3,
+    n_plates: int = 1,
+    safety_factor: float = 1.2,
 ) -> dict:
     """
-    Calculate a limiting dilution protocol.
+    Calculate required cell number and suspension volume for limiting dilution.
 
     Parameters
     ----------
-    input_conc      : float  – Starting cell concentration (cells/mL)
-    input_vol_mL    : float  – Available volume of starting suspension (mL)
-    lambda_val      : float  – Target Poisson lambda = cells per well (default 0.6)
-    well_vol_uL     : float  – Volume per well in µL (default 100)
-    n_wells         : int    – Number of wells to seed (default 96)
-    max_step_df     : int    – Maximum dilution factor per step (default 10 = 1:10)
-    min_transfer_uL : float  – Minimum pipetting volume in µL (default 20)
-    safety_factor   : float  – Extra volume buffer factor (default 1.3 = 30% extra)
+    lambda_val    : Poisson λ = target cells per well
+    well_vol_uL   : volume per well (µL)
+    n_wells       : wells per plate (96 or 384)
+    n_plates      : number of plates to seed
+    safety_factor : extra buffer (default 1.2 = 20% extra)
 
     Returns
     -------
-    dict with protocol steps, Poisson statistics, and volume flags.
+    dict with all derived quantities
     """
-    if input_conc <= 0:
-        raise ValueError("細胞濃度には正の値を入力してください。")
-    if input_vol_mL <= 0:
-        raise ValueError("ボリュームには正の値を入力してください。")
+    well_vol_mL   = well_vol_uL / 1000.0
+    target_conc   = lambda_val / well_vol_mL          # cells/mL — add this to each well
 
-    well_vol_mL = well_vol_uL / 1000.0
-    target_conc = lambda_val / well_vol_mL  # cells/mL
+    total_wells   = n_wells * n_plates
+    total_vol_mL  = total_wells * well_vol_mL * safety_factor
+    total_cells   = target_conc * total_vol_mL
 
-    if input_conc < target_conc:
-        raise ValueError(
-            f"入力濃度 ({input_conc:.2e} cells/mL) が目標濃度 "
-            f"({target_conc:.2e} cells/mL) より低いです。\n"
-            "細胞を濃縮するか、λ値を下げてください。"
-        )
-
-    total_df = input_conc / target_conc
-
-    # ── Factorize total dilution factor into serial steps ──────────
-    step_dfs = []
-    remaining = total_df
-    while remaining > max_step_df * 1.001:
-        step_dfs.append(float(max_step_df))
-        remaining /= max_step_df
-    if remaining > 1.001:
-        step_dfs.append(remaining)
-    if not step_dfs:
-        step_dfs = [total_df]
-
-    # ── Calculate tube volumes (backwards from final tube) ─────────
-    plate_vol_uL  = n_wells * well_vol_uL * safety_factor  # volume needed for plating
-    min_tube_vol  = 300.0                                   # µL, minimum per tube
-
-    tube_vols = [max(plate_vol_uL, min_tube_vol)]
-
-    for df in reversed(step_dfs[1:]):
-        transfer_needed = tube_vols[0] / df
-        # Enforce minimum transfer volume by scaling up downstream volumes
-        if transfer_needed < min_transfer_uL:
-            scale = min_transfer_uL / transfer_needed
-            tube_vols = [v * scale for v in tube_vols]
-            transfer_needed = min_transfer_uL
-        this_vol = max(transfer_needed * safety_factor, min_tube_vol)
-        tube_vols.insert(0, this_vol)
-
-    # ── Build step list ────────────────────────────────────────────
-    steps = []
-    conc = input_conc
-    for i, (df, tvol) in enumerate(zip(step_dfs, tube_vols)):
-        transfer = tvol / df
-        media    = tvol - transfer
-        new_conc = conc / df
-        steps.append({
-            "step":        i + 1,
-            "from_conc":   conc,
-            "df":          df,
-            "transfer_uL": round(transfer, 1),
-            "media_uL":    round(media, 1),
-            "total_uL":    round(tvol, 1),
-            "to_conc":     new_conc,
-        })
-        conc = new_conc
-
-    # ── Poisson statistics ─────────────────────────────────────────
-    po     = poisson(lambda_val)
+    po = poisson(lambda_val)
     p0     = po.pmf(0)
     p1     = po.pmf(1)
     p2plus = 1.0 - po.cdf(1)
 
-    vol_needed_uL = steps[0]["transfer_uL"]
-    volume_ok     = input_vol_mL * 1000 >= vol_needed_uL
+    expected_empty  = total_wells * p0
+    expected_single = total_wells * p1
+    expected_multi  = total_wells * p2plus
 
     return {
-        "input_conc":      input_conc,
-        "input_vol_mL":    input_vol_mL,
-        "target_conc":     target_conc,
-        "lambda_val":      lambda_val,
-        "well_vol_uL":     well_vol_uL,
-        "n_wells":         n_wells,
-        "total_df":        total_df,
-        "n_steps":         len(steps),
-        "steps":           steps,
-        "final_conc":      conc,
-        "plate_vol_uL":    plate_vol_uL,
-        "vol_needed_uL":   vol_needed_uL,
-        "volume_ok":       volume_ok,
-        "p0":              p0,
-        "p1":              p1,
-        "p2plus":          p2plus,
-        "expected_single": n_wells * p1,
+        "lambda_val":       lambda_val,
+        "well_vol_uL":      well_vol_uL,
+        "well_vol_mL":      well_vol_mL,
+        "n_wells":          n_wells,
+        "n_plates":         n_plates,
+        "safety_factor":    safety_factor,
+        "target_conc":      target_conc,        # cells/mL
+        "total_wells":      total_wells,
+        "total_vol_mL":     total_vol_mL,       # mL of suspension to prepare
+        "total_cells":      total_cells,        # cells to prepare
+        "p0":               p0,
+        "p1":               p1,
+        "p2plus":           p2plus,
+        "expected_empty":   expected_empty,
+        "expected_single":  expected_single,
+        "expected_multi":   expected_multi,
     }
+
+
+def table_by_lambda(
+    well_vol_uL: float = 100.0,
+    n_wells: int = 96,
+    n_plates: int = 1,
+    safety_factor: float = 1.2,
+    lambdas: tuple = (0.3, 0.5, 0.6, 1.0),
+) -> list[dict]:
+    """Return calculate() results for multiple λ values."""
+    return [calculate(lam, well_vol_uL, n_wells, n_plates, safety_factor)
+            for lam in lambdas]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2. Visualization
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _fmt(c: float) -> str:
-    """Format concentration as compact scientific notation string."""
-    if c == 0:
-        return "0"
-    exp = int(math.floor(math.log10(abs(c))))
-    m   = c / 10 ** exp
-    if abs(m - round(m)) < 0.05:
-        return f"{m:.0f}e{exp}"
-    return f"{m:.2f}e{exp}"
+_LAMBDA_COLORS = {
+    0.3: "#2980b9",
+    0.5: "#27ae60",
+    0.6: "#e67e22",
+    1.0: "#e74c3c",
+}
+_DEFAULT_COLOR = "#8e44ad"
+
+RECOMMENDED_LAMBDA = 0.6
 
 
-def _box(ax, x, y, w, h, color, line1="", line2="", label=""):
-    """Draw a rounded box (tube) on a matplotlib axes."""
-    ax.add_patch(FancyBboxPatch(
-        (x - w, y - h), 2 * w, 2 * h,
-        boxstyle="round,pad=0.01",
-        facecolor=color, edgecolor="white", linewidth=2, alpha=0.92,
-        transform=ax.transData, zorder=2,
-    ))
-    ax.text(x, y + h * 0.18, line1, ha="center", va="center",
-            fontsize=7.5, color="white", fontweight="bold", zorder=3, clip_on=True)
-    ax.text(x, y - h * 0.28, line2, ha="center", va="center",
-            fontsize=6.5, color="white", alpha=0.88, zorder=3, clip_on=True)
-    if label:
-        ax.text(x, y - h - 0.07, label, ha="center", va="top",
-                fontsize=7.5, fontweight="bold", color="#2c3e50", zorder=3)
+def _bar_color(lam):
+    return _LAMBDA_COLORS.get(lam, _DEFAULT_COLOR)
 
 
-def _plate(ax, x, y, w, h, n_wells):
-    """Draw a micro-plate icon."""
-    ax.add_patch(FancyBboxPatch(
-        (x - w, y - h), 2 * w, 2 * h,
-        boxstyle="round,pad=0.01",
-        facecolor="#ecf0f1", edgecolor="#95a5a6", linewidth=2, zorder=2,
-    ))
-    rows, cols = (8, 12) if n_wells == 96 else (16, 24) if n_wells == 384 else (4, 6)
-    r_s, c_s = min(rows, 8), min(cols, 10)
-    dxs = np.linspace(x - w * 0.80, x + w * 0.80, c_s)
-    dys = np.linspace(y - h * 0.68, y + h * 0.68, r_s)
-    ms  = 2.5 if n_wells <= 96 else 1.2
-    for dx in dxs:
-        for dy in dys:
-            ax.plot(dx, dy, "o", color="#95a5a6", markersize=ms, zorder=3)
-    ax.text(x, y - h - 0.07, f"{n_wells}-well plate",
-            ha="center", va="top", fontsize=8.5, fontweight="bold", color="#2c3e50")
+def plot_result(result: dict, fig=None, axes=None):
+    """
+    Two-panel figure:
+      Left  — Poisson PMF bar chart
+      Right — λ comparison table (cells & volume for λ = 0.3, 0.5, 0.6, 1.0)
+    """
+    if fig is None:
+        fig = plt.figure(figsize=(13, 5.5), facecolor="white")
+
+    gs = gridspec.GridSpec(1, 2, figure=fig,
+                           width_ratios=[1, 1.4], wspace=0.10)
+    ax_poi = fig.add_subplot(gs[0])
+    ax_tbl = fig.add_subplot(gs[1])
+
+    _plot_poisson(ax_poi, result)
+    _plot_comparison_table(ax_tbl, result)
+
+    fig.suptitle(
+        f"Limiting Dilution  —  {result['n_plates']} plate{'s' if result['n_plates'] > 1 else ''} "
+        f"× {result['n_wells']} wells, {result['well_vol_uL']:.0f} µL/well",
+        fontsize=12, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout(pad=2.2)
+    plt.show()
 
 
 def _plot_poisson(ax, result):
-    """Bar chart of Poisson PMF."""
     lam    = result["lambda_val"]
-    k_vals = list(range(6))
+    k_vals = list(range(7))
     probs  = [poisson.pmf(k, lam) * 100 for k in k_vals]
-    probs[5] = (1 - poisson.cdf(4, lam)) * 100
-    labels = ["0", "1", "2", "3", "4", "≥5"]
-    colors = ["#95a5a6", "#27ae60", "#e67e22", "#e74c3c", "#c0392b", "#7b241c"]
+    probs[6] = (1 - poisson.cdf(5, lam)) * 100
+    xlabels = ["0", "1", "2", "3", "4", "5", "≥6"]
 
-    bars = ax.bar(range(6), probs, color=colors, edgecolor="white",
-                  linewidth=1.5, width=0.62, zorder=2)
-    ax.set_xticks(range(6))
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_xlabel("Cells per well (k)", fontsize=11)
-    ax.set_ylabel("Probability (%)", fontsize=11)
-    ax.set_title(f"Poisson Distribution  (λ = {lam})",
-                 fontsize=12, fontweight="bold", pad=8)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.set_facecolor("white")
-    ax.set_ylim(0, max(probs) * 1.28)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4, zorder=0)
+    base_col = _bar_color(lam)
+    colors = [
+        "#95a5a6",    # 0  — empty
+        "#27ae60",    # 1  — target ✓
+        "#e67e22",    # 2
+        "#e74c3c",    # 3
+        "#c0392b",    # 4
+        "#922b21",    # 5
+        "#7b241c",    # ≥6
+    ]
+    bars = ax.bar(range(7), probs, color=colors,
+                  edgecolor="white", linewidth=1.4, width=0.62, zorder=2)
 
     for bar, p in zip(bars, probs):
         if p > 0.5:
@@ -240,324 +180,306 @@ def _plot_poisson(ax, result):
                     f"{p:.1f}%", ha="center", va="bottom",
                     fontsize=9, fontweight="bold")
 
-    info = (f"P(0) = {result['p0']:.1%}   empty\n"
-            f"P(1) = {result['p1']:.1%}   single ✓\n"
-            f"P(≥2) = {result['p2plus']:.1%}  multi")
+    ax.set_xticks(range(7))
+    ax.set_xticklabels(xlabels, fontsize=11)
+    ax.set_xlabel("Cells per well (k)", fontsize=11)
+    ax.set_ylabel("Probability (%)", fontsize=11)
+    ax.set_title(f"Poisson  (λ = {lam})", fontsize=12, fontweight="bold", pad=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_facecolor("white")
+    ax.set_ylim(0, max(probs) * 1.30)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.35, zorder=0)
+
+    tw = result["total_wells"]
+    info = (
+        f"P(0) = {result['p0']:.1%}  →  ~{result['expected_empty']:.0f} empty wells\n"
+        f"P(1) = {result['p1']:.1%}  →  ~{result['expected_single']:.0f} single-cell ✓\n"
+        f"P(≥2) = {result['p2plus']:.1%}  →  ~{result['expected_multi']:.0f} multi-cell"
+    )
     ax.text(0.97, 0.97, info, transform=ax.transAxes,
-            ha="right", va="top", fontsize=9, fontfamily="monospace",
+            ha="right", va="top", fontsize=8.8, fontfamily="monospace",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="#eaf4fb",
-                      edgecolor="#a9cce3", alpha=0.9))
+                      edgecolor="#a9cce3", alpha=0.92))
 
 
-def _plot_scheme(ax, result):
-    """Dilution flow diagram: Stock → Tube1 → … → TubeN → Plate."""
+def _plot_comparison_table(ax, result):
+    """Right panel: λ comparison with highlighted selected row."""
     ax.axis("off")
     ax.set_facecolor("white")
-    ax.set_title("Dilution Scheme", fontsize=12, fontweight="bold", pad=8)
+    ax.set_title("Required cells & volume by λ", fontsize=12, fontweight="bold", pad=8)
 
-    steps = result["steps"]
-    n_obj = len(steps) + 2  # Stock + tubes + plate
+    lambdas      = [0.3, 0.5, 0.6, 1.0]
+    rows_data    = table_by_lambda(
+        well_vol_uL   = result["well_vol_uL"],
+        n_wells       = result["n_wells"],
+        n_plates      = result["n_plates"],
+        safety_factor = result["safety_factor"],
+        lambdas       = lambdas,
+    )
 
-    xs  = np.linspace(0.06, 0.94, n_obj)
-    y   = 0.60
-    bw  = min(0.072, 0.78 / (2 * n_obj))
-    bh  = 0.20
+    col_labels = ["λ", "Target conc.\n(cells/mL)", "Volume\n(mL)", "Cells needed", "P(1)\nsingle-cell",
+                  "Expected\nsingle-cell wells"]
+    col_widths = [0.08, 0.20, 0.14, 0.22, 0.14, 0.18]
 
-    COLORS = (["#2e86de"]
-              + ["#8e44ad"] * max(len(steps) - 1, 0)
-              + ["#e74c3c"])
+    # Header
+    y_header = 0.93
+    x_start  = 0.02
+    xs = [x_start + sum(col_widths[:i]) for i in range(len(col_widths))]
 
-    # Stock
-    _box(ax, xs[0], y, bw, bh, "#2e86de",
-         line1=_fmt(result["input_conc"]),
-         line2="cells/mL", label="Stock")
+    ax.add_patch(plt.Rectangle((x_start - 0.01, y_header - 0.045),
+                                sum(col_widths) + 0.02, 0.055,
+                                transform=ax.transAxes, zorder=2,
+                                facecolor="#1a4f7a", edgecolor="none"))
+    for x, label in zip(xs, col_labels):
+        ax.text(x + col_widths[col_labels.index(label)] / 2,
+                y_header - 0.015,
+                label, transform=ax.transAxes,
+                ha="center", va="center", fontsize=8.5,
+                color="white", fontweight="bold")
 
-    for i, step in enumerate(steps):
-        x0  = xs[i] + bw
-        x1  = xs[i + 1] - bw
-        mid = (x0 + x1) / 2
+    # Data rows
+    row_h  = 0.115
+    y0     = y_header - 0.045
 
-        ax.annotate("", xy=(x1, y), xytext=(x0, y),
-                    arrowprops=dict(arrowstyle="-|>", color="#444",
-                                   lw=1.8, mutation_scale=14), zorder=4)
+    for i, (lam, row) in enumerate(zip(lambdas, rows_data)):
+        y_top  = y0 - i * row_h
+        y_mid  = y_top - row_h / 2
+        is_sel = abs(lam - result["lambda_val"]) < 1e-9
 
-        n_s = len(steps)
-        fsa = max(6.5, 8.5 - 0.4 * max(0, n_s - 3))
-        ax.text(mid, y + bh + 0.09, f"{step['transfer_uL']:.1f} µL",
-                ha="center", va="bottom", fontsize=fsa,
-                color="#e67e22", fontweight="bold")
-        ax.text(mid, y + bh + 0.01, f"(1:{step['df']:.0f})",
-                ha="center", va="bottom", fontsize=max(6.0, fsa-1), color="#666")
-        ax.text(mid, y - bh - 0.03, f"+ {step['media_uL']:.1f} µL",
-                ha="center", va="top", fontsize=max(6.0, fsa-0.5), color="#27ae60")
+        bg = "#fff8ee" if is_sel else ("#f5faff" if i % 2 == 0 else "white")
+        edge_col = "#e67e22" if is_sel else "none"
+        lw = 2.0 if is_sel else 0
 
-        col = COLORS[min(i + 1, len(COLORS) - 1)]
-        is_last = (i == len(steps) - 1)
-        _box(ax, xs[i + 1], y, bw, bh, col,
-             line1=_fmt(step["to_conc"]),
-             line2="cells/mL",
-             label=f"Tube {i+1}" + (" (final)" if is_last else ""))
+        ax.add_patch(plt.Rectangle((x_start - 0.01, y_top - row_h),
+                                    sum(col_widths) + 0.02, row_h,
+                                    transform=ax.transAxes, zorder=1,
+                                    facecolor=bg, edgecolor=edge_col, linewidth=lw))
 
-    # Arrow to plate
-    x0  = xs[-2] + bw
-    x1  = xs[-1] - bw
-    mid = (x0 + x1) / 2
-    ax.annotate("", xy=(x1, y), xytext=(x0, y),
-                arrowprops=dict(arrowstyle="-|>", color="#444",
-                                lw=1.8, mutation_scale=14), zorder=4)
-    ax.text(mid, y + bh + 0.09, f"{result['well_vol_uL']:.0f} µL/well",
-            ha="center", va="bottom", fontsize=8.5,
-            color="#e67e22", fontweight="bold")
-    _plate(ax, xs[-1], y, bw, bh, result["n_wells"])
+        cells = row["total_cells"]
+        cells_str = (f"{cells/1e6:.2f}×10⁶" if cells >= 1e6
+                     else f"{cells/1e3:.1f}×10³" if cells >= 1e3
+                     else f"{cells:.0f}")
 
-    # Footer summary
-    foot = (f"Total dilution: 1/{result['total_df']:.2e}    "
-            f"Target: {result['target_conc']:.2e} cells/mL    "
-            f"Expected single-cell wells: ~{result['expected_single']:.0f} / {result['n_wells']}")
-    ax.text(0.5, 0.06, foot, transform=ax.transAxes,
-            ha="center", va="center", fontsize=8.5,
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="#eaf4fb",
-                      edgecolor="#aed6f1", alpha=0.9))
+        conc = row["target_conc"]
+        conc_str = (f"{conc:.0f}" if conc >= 1
+                    else f"{conc:.2f}")
 
+        values = [
+            f"{'★ ' if is_sel else ''}{lam}",
+            conc_str,
+            f"{row['total_vol_mL']:.2f}",
+            cells_str,
+            f"{row['p1']:.1%}",
+            f"~{row['expected_single']:.0f}",
+        ]
 
-def plot_result(result, figsize=None):
-    """Main visualization: Poisson chart + dilution scheme side by side."""
-    n = result["n_steps"]
-    if figsize is None:
-        figsize = (max(13, 5 + n * 2), 6)
-    ratio = max(1.5, 0.65 * (n + 2))
+        fw = "bold" if is_sel else "normal"
+        fs = 9.2 if is_sel else 8.8
 
-    fig = plt.figure(figsize=figsize, facecolor="white")
-    gs  = fig.add_gridspec(1, 2, width_ratios=[1, ratio], wspace=0.06)
+        for j, (x, val) in enumerate(zip(xs, values)):
+            ax.text(x + col_widths[j] / 2, y_mid, val,
+                    transform=ax.transAxes,
+                    ha="center", va="center",
+                    fontsize=fs, fontweight=fw,
+                    color="#1a1a1a")
 
-    ax1 = fig.add_subplot(gs[0])
-    ax2 = fig.add_subplot(gs[1])
-
-    _plot_poisson(ax1, result)
-    _plot_scheme(ax2, result)
-
-    plt.tight_layout(pad=2.5)
-    plt.show()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3. Text / CLI output
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def print_protocol(result):
-    """Print a human-readable protocol to stdout."""
-    W = 68
-    print("=" * W)
-    print("  🔬  LIMITING DILUTION PROTOCOL")
-    print("=" * W)
-    print(f"  Input : {result['input_conc']:.2e} cells/mL  "
-          f"({result['input_vol_mL']} mL available)")
-    print(f"  Target: {result['target_conc']:.2e} cells/mL  "
-          f"(λ = {result['lambda_val']} / {result['well_vol_uL']} µL well)")
-    print(f"  Total dilution factor: 1/{result['total_df']:.2e}  "
-          f"→  {result['n_steps']} step(s)")
-
-    if not result["volume_ok"]:
-        need = result["vol_needed_uL"] / 1000
-        print(f"\n  ⚠️  WARNING: input volume ({result['input_vol_mL']} mL) "
-              f"may be insufficient (need ≥ {need:.3f} mL)")
-
-    print()
-    print("─" * W)
-    print(f"  {'Step':<5} {'From (c/mL)':<14} {'DF':<8} "
-          f"{'Transfer':>10} {'+ Medium':>10} {'= Total':>10} {'To (c/mL)':<14}")
-    print("  " + "─" * 64)
-
-    for s in result["steps"]:
-        print(f"  {s['step']:<5} {s['from_conc']:<14.3e} 1:{s['df']:<6.0f} "
-              f"{s['transfer_uL']:>8.1f} µL {s['media_uL']:>8.1f} µL "
-              f"{s['total_uL']:>8.1f} µL {s['to_conc']:<14.3e}")
-
-    n = result["n_steps"]
-    print("─" * W)
-    print(f"\n  PLATING: Take {result['well_vol_uL']:.0f} µL from Tube {n} "
-          f"→ each of {result['n_wells']} wells")
-    print(f"  Volume needed: {result['plate_vol_uL']:.0f} µL "
-          f"({result['plate_vol_uL']/1000:.2f} mL)\n")
-
-    print("─" * W)
-    print("  POISSON STATISTICS")
-    print("─" * W)
-    print(f"  P(0 cells/well) = {result['p0']:.1%}   ← empty wells")
-    print(f"  P(1 cell/well)  = {result['p1']:.1%}   ← single-cell cloning ✓")
-    print(f"  P(≥2 cells/well)= {result['p2plus']:.1%}   ← multi-cell contamination")
-    print(f"\n  Expected single-cell wells: ~{result['expected_single']:.0f} / {result['n_wells']}")
-    print("=" * W)
+    # Footer note
+    sf_pct = int((result["safety_factor"] - 1) * 100)
+    note = (f"★ = selected lambda   /   +{sf_pct}% safety buffer   "
+            f"/   {result['well_vol_uL']:.0f} uL per well")
+    ax.text(0.5, 0.01, note, transform=ax.transAxes,
+            ha="center", va="bottom", fontsize=8, color="#666",
+            style="italic")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4. HTML output (Colab)
+# 3. HTML table (Colab)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _CSS = """
 <style>
-.ld-wrap  { font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 900px; }
-.ld-card  { background: #f8fafd; border: 1px solid #c8dff5; border-radius: 10px;
-            padding: 16px 20px; margin: 8px 0; }
-.ld-h1    { font-size: 1.25em; font-weight: 700; color: #1a4f7a; margin: 0 0 4px 0; }
-.ld-sub   { color: #5d6d7e; font-size: 0.88em; margin: 0 0 12px 0; }
-.ld-tbl   { border-collapse: collapse; width: 100%; font-size: 0.9em; margin-top: 8px; }
-.ld-tbl th { background: #2471a3; color: #fff; padding: 7px 10px; text-align: center; }
-.ld-tbl td { padding: 6px 10px; text-align: center; border-bottom: 1px solid #e0eaf5; }
-.ld-tbl tr:nth-child(even) td { background: #eaf4fb; }
-.ld-tbl tr.final td { background: #fdebd0; font-weight: 600; }
-.ld-warn  { background: #fef9e7; border-left: 4px solid #f39c12; padding: 8px 12px;
-            border-radius: 4px; margin: 8px 0; font-size: 0.9em; }
-.ld-ok    { background: #eafaf1; border-left: 4px solid #27ae60; padding: 8px 12px;
-            border-radius: 4px; margin: 8px 0; font-size: 0.9em; }
-.ld-badge { display: inline-block; background: #1a4f7a; color: #fff; border-radius: 6px;
-            padding: 3px 11px; margin: 2px 3px; font-size: 0.88em; }
+.ld { font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 820px; }
+.ld-card { background:#f8fafd; border:1.5px solid #c8dff5; border-radius:10px;
+           padding:16px 22px; margin:10px 0; }
+.ld-h1   { font-size:1.2em; font-weight:700; color:#1a4f7a; margin:0 0 4px 0; }
+.ld-sub  { color:#5d6d7e; font-size:0.88em; margin:0 0 14px 0; }
+.ld-big  { font-size:2em; font-weight:800; color:#1a4f7a; letter-spacing:-0.5px; }
+.ld-unit { font-size:0.85em; color:#5d6d7e; margin-left:4px; }
+.ld-kpi  { display:inline-block; background:#eaf4fb; border:1px solid #aed6f1;
+           border-radius:8px; padding:10px 18px; margin:4px 6px; text-align:center; }
+.ld-tbl  { border-collapse:collapse; width:100%; font-size:0.9em; margin-top:12px; }
+.ld-tbl th { background:#1a4f7a; color:#fff; padding:8px 12px; text-align:center; }
+.ld-tbl td { padding:7px 12px; text-align:center; border-bottom:1px solid #e0eaf5; }
+.ld-tbl tr:nth-child(even) td { background:#f0f8ff; }
+.ld-tbl tr.sel td { background:#fff3e0; font-weight:700;
+                    border-top:2px solid #e67e22; border-bottom:2px solid #e67e22; }
+.ld-tbl td:first-child { font-weight:700; }
+.ld-badge { display:inline-block; background:#1a4f7a; color:#fff; border-radius:6px;
+            padding:3px 11px; margin:2px 3px; font-size:0.88em; }
+.ld-note  { color:#888; font-size:0.82em; margin-top:10px; }
 </style>
 """
 
-def render_html(result) -> str:
-    """Return styled HTML string of the protocol."""
-    steps = result["steps"]
-    rows  = ""
-    for s in steps:
-        cls = ' class="final"' if s["step"] == len(steps) else ""
-        rows += (f"<tr{cls}>"
-                 f"<td>{s['step']}</td>"
-                 f"<td>{s['from_conc']:.3e}</td>"
-                 f"<td>1 : {s['df']:.0f}</td>"
-                 f"<td><b>{s['transfer_uL']:.1f}</b></td>"
-                 f"<td>{s['media_uL']:.1f}</td>"
-                 f"<td>{s['total_uL']:.1f}</td>"
-                 f"<td>{s['to_conc']:.3e}</td>"
-                 f"</tr>")
 
-    warn = ""
-    if not result["volume_ok"]:
-        need = result["vol_needed_uL"] / 1000
-        warn = (f'<div class="ld-warn">⚠️ 入力ボリューム ({result["input_vol_mL"]:.2f} mL) が不足する可能性があります。'
-                f'最低 <b>{need:.3f} mL</b> 必要です。</div>')
+def render_html(result: dict) -> str:
+    """Styled HTML summary card + λ comparison table."""
+    lam  = result["lambda_val"]
+    rows = table_by_lambda(
+        well_vol_uL   = result["well_vol_uL"],
+        n_wells       = result["n_wells"],
+        n_plates      = result["n_plates"],
+        safety_factor = result["safety_factor"],
+    )
 
-    plating = (f'<div class="ld-ok">'
-               f'✅ <b>プレーティング:</b> Tube {len(steps)} から '
-               f'<b>{result["well_vol_uL"]:.0f} µL</b> を各ウェルに分注 '
-               f'({result["n_wells"]} wells)  ／  '
-               f'必要量: {result["plate_vol_uL"]:.0f} µL ({result["plate_vol_uL"]/1000:.2f} mL)'
-               f'</div>')
+    def _cells_str(c):
+        if c >= 1e6:   return f"{c/1e6:.3f} × 10<sup>6</sup>"
+        if c >= 1e3:   return f"{c/1e3:.2f} × 10<sup>3</sup>"
+        return f"{c:.0f}"
 
-    badges = "".join([
-        f'<span class="ld-badge">λ = {result["lambda_val"]}</span>',
-        f'<span class="ld-badge">P(0) = {result["p0"]:.1%}</span>',
-        f'<span class="ld-badge">P(1) = {result["p1"]:.1%} ✓</span>',
-        f'<span class="ld-badge">P(≥2) = {result["p2plus"]:.1%}</span>',
-        f'<span class="ld-badge">予想シングルwell: ~{result["expected_single"]:.0f} / {result["n_wells"]}</span>',
-    ])
+    # KPI cards for selected λ
+    r = result
+    kpi_cells = _cells_str(r["total_cells"])
+    kpi_vol   = f"{r['total_vol_mL']:.2f}"
+    kpi_conc  = f"{r['target_conc']:.1f}" if r["target_conc"] >= 1 else f"{r['target_conc']:.3f}"
+
+    kpi_html = f"""
+<div class="ld-kpi">
+  <div style="font-size:0.8em;color:#888;margin-bottom:2px">必要細胞数</div>
+  <span class="ld-big">{kpi_cells}</span>
+  <span class="ld-unit">cells</span>
+</div>
+<div class="ld-kpi">
+  <div style="font-size:0.8em;color:#888;margin-bottom:2px">懸濁液量</div>
+  <span class="ld-big">{kpi_vol}</span>
+  <span class="ld-unit">mL</span>
+</div>
+<div class="ld-kpi">
+  <div style="font-size:0.8em;color:#888;margin-bottom:2px">懸濁液濃度</div>
+  <span class="ld-big">{kpi_conc}</span>
+  <span class="ld-unit">cells/mL</span>
+</div>
+"""
+
+    # Comparison table rows
+    tbl_rows = ""
+    for row in rows:
+        is_sel = abs(row["lambda_val"] - lam) < 1e-9
+        cls    = ' class="sel"' if is_sel else ""
+        star   = "★ " if is_sel else ""
+        tbl_rows += (
+            f"<tr{cls}>"
+            f"<td>{star}{row['lambda_val']}</td>"
+            f"<td>{row['target_conc']:.1f}" + (" (= λ / vol)" if is_sel else "") + "</td>"
+            f"<td>{row['total_vol_mL']:.2f}</td>"
+            f"<td>{_cells_str(row['total_cells'])}</td>"
+            f"<td>{row['p1']:.1%}</td>"
+            f"<td>~{row['expected_single']:.0f} / {result['total_wells']}</td>"
+            f"</tr>"
+        )
+
+    sf_pct = int((result["safety_factor"] - 1) * 100)
 
     return f"""
 {_CSS}
-<div class="ld-wrap">
+<div class="ld">
 <div class="ld-card">
-  <p class="ld-h1">🔬 Limiting Dilution Protocol</p>
+  <p class="ld-h1">🔬 Limiting Dilution — 準備量の計算</p>
   <p class="ld-sub">
-    Input: {result["input_conc"]:.2e} cells/mL ({result["input_vol_mL"]} mL) &nbsp;|&nbsp;
-    Target: {result["target_conc"]:.2e} cells/mL &nbsp;|&nbsp;
-    総希釈倍率: 1/{result["total_df"]:.2e} &nbsp;({result["n_steps"]} step{'s' if result["n_steps"] > 1 else ''})
+    {result['n_plates']} plate{'s' if result['n_plates'] > 1 else ''} ×
+    {result['n_wells']} wells,
+    {result['well_vol_uL']:.0f} µL/well,
+    λ = {lam}　（安全係数 +{sf_pct}%）
   </p>
 
-  {warn}
+  <div style="margin-bottom:14px">{kpi_html}</div>
 
   <table class="ld-tbl">
-    <thead>
-      <tr>
-        <th>Step</th><th>From (cells/mL)</th><th>希釈倍率</th>
-        <th>分注量 (µL)</th><th>培地量 (µL)</th><th>合計 (µL)</th><th>To (cells/mL)</th>
-      </tr>
-    </thead>
-    <tbody>{rows}</tbody>
+    <thead><tr>
+      <th>λ</th>
+      <th>目標濃度 (cells/mL)</th>
+      <th>必要量 (mL)</th>
+      <th>必要細胞数</th>
+      <th>P(1) 単細胞率</th>
+      <th>予想シングルwells</th>
+    </tr></thead>
+    <tbody>{tbl_rows}</tbody>
   </table>
 
-  {plating}
-  <div style="margin-top:10px">{badges}</div>
+  <p class="ld-note">
+    ★ 選択中の λ ／
+    必要量 = {result['n_plates']} plate × {result['n_wells']} wells ×
+    {result['well_vol_uL']:.0f} µL × {result['safety_factor']} (安全係数) ／
+    必要濃度 = λ ÷ {result['well_vol_uL']:.0f} µL = {kpi_conc} cells/mL
+  </p>
 </div>
 </div>
 """
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5. Colab Widget UI
+# 4. Widget UI (Colab / Jupyter)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def launch_ui():
-    """Launch interactive widget UI (requires Google Colab / Jupyter)."""
-    if not _COLAB_AVAILABLE:
-        print("ipywidgets / IPython not available. Using CLI mode.\n")
-        _cli_mode()
-        return
+    if not _COLAB:
+        _cli(); return
 
-    style  = {"description_width": "200px"}
-    layout = widgets.Layout(width="420px")
+    S = {"description_width": "180px"}
+    L = widgets.Layout(width="400px")
 
-    # ── Input widgets ──────────────────────────────────────────────
-    w_conc = widgets.FloatText(
-        value=1e6, description="細胞濃度 (cells/mL):",
-        style=style, layout=layout)
-    w_vol = widgets.FloatText(
-        value=1.0, description="手持ちボリューム (mL):",
-        style=style, layout=layout)
+    w_plates = widgets.BoundedIntText(
+        value=1, min=1, max=50,
+        description="プレート数:", style=S, layout=L)
 
     w_lambda = widgets.Dropdown(
         options=[("0.3  — very conservative", 0.3),
                  ("0.5  — conservative",       0.5),
                  ("0.6  — recommended ✓",      0.6),
                  ("1.0  — higher seeding",     1.0)],
-        value=0.6, description="λ (cells/well):",
-        style=style, layout=layout)
+        value=0.6,
+        description="λ (cells/well):", style=S, layout=L)
 
     w_well_vol = widgets.Dropdown(
-        options=[("100 µL  (96-well standard)", 100),
-                 ("200 µL",                     200),
-                 ("50 µL",                       50)],
-        value=100, description="ウェル容量 (µL):",
-        style=style, layout=layout)
+        options=[("100 µL  (96-well standard)", 100.0),
+                 ("200 µL",                     200.0),
+                 ("50 µL",                       50.0)],
+        value=100.0,
+        description="ウェル容量 (µL):", style=S, layout=L)
 
     w_n_wells = widgets.Dropdown(
         options=[96, 384, 48, 24], value=96,
-        description="ウェル数:", style=style, layout=layout)
+        description="ウェル数:", style=S, layout=L)
 
-    w_max_df = widgets.Dropdown(
-        options=[("1:10 ずつ — 推奨",  10),
-                 ("1:5  ずつ",          5),
-                 ("1:20 ずつ",         20),
-                 ("1:50 ずつ",         50),
-                 ("1:100 ずつ",       100)],
-        value=10, description="1ステップ最大希釈倍率:",
-        style=style, layout=layout)
-
-    w_min_tr = widgets.FloatText(
-        value=20.0, description="最小分注量 (µL):",
-        style=style, layout=layout)
+    w_safety = widgets.FloatSlider(
+        value=1.2, min=1.0, max=2.0, step=0.05,
+        description="安全係数:",
+        readout_format=".2f",
+        style=S, layout=L)
 
     btn = widgets.Button(
-        description=" 計算する ",
+        description="　計算する　",
         button_style="primary",
         icon="calculator",
-        layout=widgets.Layout(width="200px", height="42px", margin="14px 0 4px 200px"))
+        layout=widgets.Layout(width="190px", height="42px",
+                              margin="14px 0 4px 180px"))
 
     out = widgets.Output()
-    sep = widgets.HTML("<hr style='margin:10px 0; border-color:#c8dff5;'>")
+    sep = widgets.HTML("<hr style='margin:8px 0;border-color:#c8dff5;'>")
 
     ui = widgets.VBox([
         widgets.HTML(
-            "<h2 style='color:#1a4f7a;margin:4px 0 2px 0'>🔬 Limiting Dilution Calculator</h2>"
-            "<p style='color:#5d6d7e;font-size:0.9em;margin:0 0 12px 0'>"
-            "限界希釈プロトコール自動計算ツール</p>"),
-        widgets.HTML("<b style='color:#2c3e50'>▸ 細胞サンプル</b>"),
-        w_conc, w_vol,
+            "<h2 style='color:#1a4f7a;margin:4px 0 2px'>🔬 Limiting Dilution Calculator</h2>"
+            "<p style='color:#5d6d7e;font-size:0.9em;margin:0 0 10px'>"
+            "何プレートをどのλで播くか → 必要な細胞数・懸濁液量を計算</p>"),
+        widgets.HTML("<b style='color:#2c3e50'>▸ 実験条件</b>"),
+        w_plates,
         sep,
         widgets.HTML("<b style='color:#2c3e50'>▸ プレート設定</b>"),
         w_lambda, w_well_vol, w_n_wells,
         sep,
-        widgets.HTML("<b style='color:#2c3e50'>▸ 希釈設定</b>"),
-        w_max_df, w_min_tr,
+        widgets.HTML("<b style='color:#2c3e50'>▸ オプション</b>"),
+        w_safety,
         btn,
         out,
     ])
@@ -566,51 +488,65 @@ def launch_ui():
         with out:
             clear_output(wait=True)
             try:
-                result = calculate_protocol(
-                    input_conc=w_conc.value,
-                    input_vol_mL=w_vol.value,
-                    lambda_val=w_lambda.value,
-                    well_vol_uL=w_well_vol.value,
-                    n_wells=int(w_n_wells.value),
-                    max_step_df=int(w_max_df.value),
-                    min_transfer_uL=w_min_tr.value,
+                result = calculate(
+                    lambda_val   = w_lambda.value,
+                    well_vol_uL  = w_well_vol.value,
+                    n_wells      = int(w_n_wells.value),
+                    n_plates     = w_plates.value,
+                    safety_factor= w_safety.value,
                 )
                 display(HTML(render_html(result)))
                 plot_result(result)
-            except ValueError as e:
-                display(HTML(
-                    f"<div style='background:#fef9e7;border-left:4px solid #e74c3c;"
-                    f"padding:10px;border-radius:4px'>❌ <b>エラー:</b> {e}</div>"))
             except Exception as e:
                 display(HTML(
                     f"<div style='background:#fef9e7;border-left:4px solid #e74c3c;"
-                    f"padding:10px;border-radius:4px'>❌ 予期しないエラー: {e}</div>"))
+                    f"padding:10px;border-radius:4px'>❌ {e}</div>"))
 
     btn.on_click(on_click)
     display(ui)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 6. CLI mode (standalone script)
+# 5. CLI mode
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _cli_mode():
-    print("=== Limiting Dilution Calculator (CLI mode) ===\n")
+def _cli():
+    print("=== Limiting Dilution Calculator ===\n")
     try:
-        conc   = float(input("細胞濃度 (cells/mL) [e.g. 1e6]: "))
-        vol    = float(input("手持ちボリューム (mL) [e.g. 1.0]: "))
-        lam    = float(input("λ (cells/well) [default 0.6]: ") or 0.6)
-        wvol   = float(input("ウェル容量 µL [default 100]: ")  or 100)
-        nw     = int(input("ウェル数 [default 96]: ")          or 96)
-        maxdf  = int(input("1ステップ最大希釈倍率 [default 10]: ") or 10)
+        n_plates = int(input("プレート数 [default 1]: ") or 1)
+        lam      = float(input("λ (cells/well) [default 0.6]: ") or 0.6)
+        well_vol = float(input("ウェル容量 µL [default 100]: ") or 100)
+        n_wells  = int(input("ウェル数 [default 96]: ") or 96)
+        sf       = float(input("安全係数 [default 1.2]: ") or 1.2)
     except ValueError:
-        print("入力値が無効です。終了します。")
-        return
+        print("入力値が無効です。"); return
 
-    result = calculate_protocol(conc, vol, lam, wvol, nw, maxdf)
-    print_protocol(result)
+    result = calculate(lam, well_vol, n_wells, n_plates, sf)
+    r = result
+
+    print(f"\n{'='*55}")
+    print(f"  {n_plates} plate{'s' if n_plates > 1 else ''} × {n_wells} wells, "
+          f"{well_vol:.0f} µL/well, λ = {lam}")
+    print(f"{'='*55}")
+    print(f"  目標濃度   : {r['target_conc']:.2f} cells/mL")
+    print(f"  必要量     : {r['total_vol_mL']:.2f} mL")
+    print(f"  必要細胞数 : {r['total_cells']:.2e} cells")
+    print(f"\n  P(0) = {r['p0']:.1%}   P(1) = {r['p1']:.1%}   P(≥2) = {r['p2plus']:.1%}")
+    print(f"  予想シングルセルwell: ~{r['expected_single']:.0f} / {r['total_wells']}")
+    print(f"{'='*55}\n")
+
+    print("λ 比較:")
+    rows = table_by_lambda(well_vol, n_wells, n_plates, sf)
+    print(f"  {'λ':>5}  {'濃度 (c/mL)':>12}  {'量 (mL)':>9}  {'細胞数':>14}  P(1)")
+    print("  " + "-" * 52)
+    for row in rows:
+        cells = row["total_cells"]
+        mark  = " ★" if abs(row["lambda_val"] - lam) < 1e-9 else ""
+        print(f"  {row['lambda_val']:>5}  {row['target_conc']:>12.2f}  "
+              f"{row['total_vol_mL']:>9.2f}  {cells:>14.2e}  {row['p1']:.1%}{mark}")
+
     plot_result(result)
 
 
 if __name__ == "__main__":
-    _cli_mode()
+    _cli()
